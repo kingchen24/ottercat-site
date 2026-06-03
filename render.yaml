@@ -5,10 +5,6 @@ services:
     buildCommand: npm install && npm run build
     startCommand: npm start
     plan: free
-    disk:
-      name: data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
