@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-color: #FDFBF7;
+    color: #2D2825;
+  }
+}
+
+/* 纸质笔记本网格底纹 */
+.bg-grid-notebook {
+  background-image: radial-gradient(rgba(45, 40, 37, 0.03) 1px, transparent 0);
+  background-size: 24px 24px;
+}
