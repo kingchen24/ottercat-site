@@ -1,12 +1,20 @@
 /**
  * 獭猫 AI 宠物聊天路由
- * 独立于 @tencent-ai/agent-sdk，无额外依赖
- * 支持 SSE 流式响应，带本地兜底回复
+ * 支持多 AI 后端，自动降级：
+ *   1. DeepSeek API (DEEPSEEK_API_KEY) — 推荐，流式输出
+ *   2. CodeBuddy SDK (CODEBUDDY_API_KEY) — 可选备选
+ *   3. 本地智能回复 — 零配置兜底
+ * 全部通过 SSE 流式推送至前端
  */
 
 import { Router } from 'express';
 
 const router = Router();
+
+// ============= DeepSeek 配置 =============
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 
 // ============= 獭猫系统提示词 =============
 const OTTERCAT_SYSTEM_PROMPT = `你是一只名叫"獭猫"的可爱数字生物，生活在"爱学习的獭猫"的个人博客里。
@@ -166,11 +174,83 @@ function findLocalResponse(message) {
   return pickRandom(localResponses.default);
 }
 
-async function getAiResponse(message) {
-  let hasAi = false;
+// ============= DeepSeek API 流式调用 =============
+async function getDeepSeekResponse(message, onChunk) {
+  if (!DEEPSEEK_API_KEY) return null;
+
+  try {
+    const response = await fetch(`${DEEPSEEK_BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          { role: 'system', content: OTTERCAT_SYSTEM_PROMPT },
+          { role: 'user', content: message },
+        ],
+        temperature: 0.85,
+        max_tokens: 500,
+        stream: true,
+      }),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      console.warn(`[獭猫] DeepSeek API ${response.status}:`, errBody.slice(0, 200));
+      return null;
+    }
+
+    // 解析 SSE 流
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let content = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            content += delta;
+            if (onChunk) onChunk(delta);
+          }
+        } catch {
+          // 跳过无法解析的行
+        }
+      }
+    }
+
+    return content || null;
+  } catch (e) {
+    console.warn('[獭猫] DeepSeek 请求失败:', e.message);
+    return null;
+  }
+}
+
+// ============= CodeBuddy SDK 调用（备选） =============
+async function getCodeBuddyResponse(message) {
+  const hasKey = !!(process.env.CODEBUDDY_API_KEY || process.env.CODEBUDDY_AUTH_TOKEN);
+  if (!hasKey) return null;
+
   try {
     const { query } = await import('@tencent-ai/agent-sdk');
-    hasAi = true;
 
     const stream = query({
       prompt: message,
@@ -186,30 +266,56 @@ async function getAiResponse(message) {
     for await (const msg of stream) {
       if (msg.type === 'assistant') {
         const content = msg.message.content;
-        if (typeof content === 'string') {
-          chunks.push(content);
-        }
+        if (typeof content === 'string') chunks.push(content);
       }
     }
     return chunks.join('');
   } catch (e) {
-    // AI 不可用时，静默降级到本地回复
-    if (hasAi) console.warn('[獭猫] AI 响应失败，使用本地回复:', e.message);
+    console.warn('[獭猫] CodeBuddy SDK 失败:', e.message);
     return null;
   }
 }
 
+// ============= SSE 工具 =============
 function sendSSE(res, type, data) {
   if (!res.writableEnded) {
     res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
   }
 }
 
+function streamText(res, text) {
+  const chars = text.split('');
+  let i = 0;
+  const interval = setInterval(() => {
+    if (i < chars.length) {
+      const chunk = chars.slice(i, i + 3).join('');
+      i += 3;
+      sendSSE(res, 'text', { content: chunk });
+    } else {
+      clearInterval(interval);
+      sendSSE(res, 'done', { backend: 'local' });
+      res.end();
+    }
+  }, 20);
+
+  // 安全超时
+  setTimeout(() => {
+    clearInterval(interval);
+    if (!res.writableEnded) {
+      sendSSE(res, 'done', { backend: 'local' });
+      res.end();
+    }
+  }, 30000);
+}
+
 // ============= 路由 =============
 
 // 健康检查
 router.get('/health', (_req, res) => {
-  res.json({ status: 'ok', name: '獭猫', mood: 'happy' });
+  const backend = DEEPSEEK_API_KEY
+    ? 'deepseek'
+    : (process.env.CODEBUDDY_API_KEY ? 'codebuddy' : 'local');
+  res.json({ status: 'ok', name: '獭猫', mood: 'happy', backend });
 });
 
 // 获取心情
@@ -234,58 +340,42 @@ router.post('/chat', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   const currentSessionId = sessionId || `pet_${Date.now()}`;
-
-  // 初始化事件
   sendSSE(res, 'init', { sessionId: currentSessionId });
-
-  const hasApiKey = !!(process.env.CODEBUDDY_API_KEY || process.env.CODEBUDDY_AUTH_TOKEN);
 
   try {
     let response = null;
 
-    // 尝试 AI 回复
-    if (hasApiKey) {
-      response = await getAiResponse(message);
+    // 第一层：DeepSeek API（真流式，逐字推送）
+    if (DEEPSEEK_API_KEY) {
+      const startTime = Date.now();
+      response = await getDeepSeekResponse(message, (chunk) => {
+        sendSSE(res, 'text', { content: chunk });
+      });
+      if (response) {
+        console.log(`[獭猫] DeepSeek 响应 (${Date.now() - startTime}ms, ${response.length} 字)`);
+        sendSSE(res, 'done', { backend: 'deepseek' });
+        return res.end();
+      }
     }
 
-    // 降级到本地回复
+    // 第二层：CodeBuddy SDK
     if (!response) {
-      response = findLocalResponse(message);
-      // 模拟打字效果
-      const chars = response.split('');
-      let i = 0;
-      const interval = setInterval(() => {
-        if (i < chars.length) {
-          const chunk = chars.slice(i, i + 2).join('');
-          i += 2;
-          sendSSE(res, 'text', { content: chunk });
-        } else {
-          clearInterval(interval);
-          sendSSE(res, 'done', { duration: 0 });
-          res.end();
-        }
-      }, 25);
-
-      setTimeout(() => {
-        clearInterval(interval);
-        if (!res.writableEnded) {
-          sendSSE(res, 'done', { duration: 0 });
-          res.end();
-        }
-      }, 15000);
-
-      return;
+      response = await getCodeBuddyResponse(message);
+      if (response) {
+        // 模拟打字效果
+        streamText(res, response);
+        return;
+      }
     }
 
-    // AI 响应直接输出
-    sendSSE(res, 'text', { content: response });
-    sendSSE(res, 'done', { duration: 0 });
-    res.end();
+    // 第三层：本地兜底回复
+    response = findLocalResponse(message);
+    streamText(res, response);
   } catch (error) {
     console.error('[獭猫] 错误:', error.message);
     const fallback = findLocalResponse(message);
     sendSSE(res, 'text', { content: fallback });
-    sendSSE(res, 'done', { duration: 0 });
+    sendSSE(res, 'done', { backend: 'fallback' });
     if (!res.writableEnded) res.end();
   }
 });
