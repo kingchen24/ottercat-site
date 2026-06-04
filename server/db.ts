@@ -1,11 +1,66 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { exec } from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 支持 Render Disk 持久化：设置 DATA_DIR 环境变量指向挂载的磁盘路径
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const DB_PATH = path.join(DATA_DIR, 'database.json');
+
+// ========== Git 自动同步 ==========
+let lastPushTime = 0;
+const PUSH_COOLDOWN = 60_000; // 60 秒内不重复 push
+
+const PROJECT_DIR = path.join(__dirname, '..');
+const GITHUB_PAT = process.env.GITHUB_PAT || '';
+const GIT_USER_NAME = process.env.GIT_USER_NAME || 'OtterCat Bot';
+const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || 'bot@ottercat.site';
+const GIT_REMOTE = process.env.GIT_REMOTE || 'https://github.com/kingchen24/ottercat-site.git';
+
+function gitExec(command: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    exec(command, { cwd: PROJECT_DIR, timeout: 30_000 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+async function gitSync() {
+  if (!GITHUB_PAT) return;
+  const now = Date.now();
+  if (now - lastPushTime < PUSH_COOLDOWN) {
+    console.log('[db] Git 同步跳过（冷却中）');
+    return;
+  }
+
+  try {
+    // 配置 git 用户信息
+    await gitExec(`git config user.name "${GIT_USER_NAME}"`);
+    await gitExec(`git config user.email "${GIT_USER_EMAIL}"`);
+
+    // 添加并提交
+    await gitExec(`git add data/database.json`);
+    try {
+      await gitExec(`git commit -m "auto: save blog data"`);
+    } catch {
+      // 没有变更时 commit 会失败，正常跳过
+      return;
+    }
+
+    // Push（使用 PAT 认证）
+    const remoteUrl = GIT_REMOTE.replace(
+      'https://github.com/',
+      `https://${GITHUB_PAT}@github.com/`
+    );
+    await gitExec(`git push ${remoteUrl} main`);
+    lastPushTime = now;
+    console.log('[db] ✅ 数据已同步到 GitHub');
+  } catch (e: any) {
+    console.warn('[db] ⚠️ Git 同步失败:', e.message);
+  }
+}
 
 // 确保 data 目录存在
 if (!fs.existsSync(DATA_DIR)) {
@@ -41,6 +96,8 @@ function load(): typeof defaultData {
 // 保存数据库
 function save(data: typeof defaultData) {
   fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), 'utf-8');
+  // 异步同步到 GitHub（不阻塞请求响应）
+  gitSync().catch(e => console.warn('[db] 后台同步异常:', e.message));
 }
 
 // 生成自增 ID
