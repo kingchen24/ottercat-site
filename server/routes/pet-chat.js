@@ -12,8 +12,9 @@ import { Router } from 'express';
 const router = Router();
 
 // ============= DeepSeek 配置 =============
-const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+// 中科大 LLM API (OpenAI 兼容)
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.llm.ustc.edu.cn';
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash-ascend';
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 
 // ============= 獭猫系统提示词 =============
